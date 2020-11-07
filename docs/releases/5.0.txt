@@ -198,7 +198,9 @@ Serialization
 Signals
 ~~~~~~~
 
-* ...
+* The new :meth:`django.dispatch.Signal.asend` allows asynchronous signal
+  dispatch. Signal receivers may be synchronous or asynchronous, and will be
+  automatically adapted to the correct calling style.
 
 Templates
 ~~~~~~~~~
