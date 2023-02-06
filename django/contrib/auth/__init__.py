@@ -1,6 +1,8 @@
 import inspect
 import re
 
+from asgiref.sync import sync_to_async
+
 from django.apps import apps as django_apps
 from django.conf import settings
 from django.core.exceptions import ImproperlyConfigured, PermissionDenied
@@ -60,6 +62,14 @@ def _get_user_session_key(request):
     return get_user_model()._meta.pk.to_python(request.session[SESSION_KEY])
 
 
+async def _aget_user_session_key(request):
+    # This value in the session is always serialized to a string, so we need
+    # to convert it back to Python whenever we access it.
+    return get_user_model()._meta.pk.to_python(
+        await sync_to_async(lambda: request.session[SESSION_KEY])()
+    )
+
+
 @sensitive_variables("credentials")
 def authenticate(request=None, **credentials):
     """
@@ -87,6 +97,37 @@ def authenticate(request=None, **credentials):
 
     # The credentials supplied are invalid to all backends, fire signal
     user_login_failed.send(
+        sender=__name__, credentials=_clean_credentials(credentials), request=request
+    )
+
+
+@sensitive_variables("credentials")
+async def aauthenticate(request=None, **credentials):
+    """
+    If the given credentials are valid, return a User object.
+    """
+    for backend, backend_path in _get_backends(return_tuples=True):
+        backend_signature = inspect.signature(backend.authenticate)
+        try:
+            backend_signature.bind(request, **credentials)
+        except TypeError:
+            # This backend doesn't accept these credentials as arguments. Try
+            # the next one.
+            continue
+        try:
+            user = await backend.aauthenticate(request, **credentials)
+        except PermissionDenied:
+            # This backend says to stop in our tracks - this user should not be
+            # allowed in at all.
+            break
+        if user is None:
+            continue
+        # Annotate the user object with the path of the backend.
+        user.backend = backend_path
+        return user
+
+    # The credentials supplied are invalid to all backends, fire signal
+    await user_login_failed.asend(
         sender=__name__, credentials=_clean_credentials(credentials), request=request
     )
 
@@ -144,6 +185,66 @@ def login(request, user, backend=None):
     user_logged_in.send(sender=user.__class__, request=request, user=user)
 
 
+async def alogin(request, user, backend=None):
+    """
+    Persist a user id and a backend in the request. This way a user doesn't
+    have to reauthenticate on every request. Note that data set during
+    the anonymous session is retained when the user logs in.
+    """
+    session_auth_hash = ""
+    if user is None:
+        user = await request.auser()
+    if hasattr(user, "get_session_auth_hash"):
+        session_auth_hash = user.get_session_auth_hash()
+
+    if await sync_to_async(lambda: SESSION_KEY in request.session)():
+        if await _aget_user_session_key(request) != user.pk or (
+            session_auth_hash
+            and not constant_time_compare(
+                await sync_to_async(
+                    lambda: request.session.get(HASH_SESSION_KEY, "")
+                )(),
+                session_auth_hash,
+            )
+        ):
+            # To avoid reusing another user's session, create a new, empty
+            # session if the existing session corresponds to a different
+            # authenticated user.
+            await sync_to_async(lambda: request.session.flush())()
+    else:
+        await sync_to_async(lambda: request.session.cycle_key())()
+
+    try:
+        backend = backend or user.backend
+    except AttributeError:
+        backends = _get_backends(return_tuples=True)
+        if len(backends) == 1:
+            _, backend = backends[0]
+        else:
+            raise ValueError(
+                "You have multiple authentication backends configured and "
+                "therefore must provide the `backend` argument or set the "
+                "`backend` attribute on the user."
+            )
+    else:
+        if not isinstance(backend, str):
+            raise TypeError(
+                "backend must be a dotted import path string (got %r)." % backend
+            )
+
+    @sync_to_async
+    def update_session():
+        request.session[SESSION_KEY] = user._meta.pk.value_to_string(user)
+        request.session[BACKEND_SESSION_KEY] = backend
+        request.session[HASH_SESSION_KEY] = session_auth_hash
+
+    await update_session()
+    if hasattr(request, "user"):
+        request.user = user
+    rotate_token(request)
+    await user_logged_in.asend(sender=user.__class__, request=request, user=user)
+
+
 def logout(request):
     """
     Remove the authenticated user's ID from the request and flush their session
@@ -156,6 +257,24 @@ def logout(request):
         user = None
     user_logged_out.send(sender=user.__class__, request=request, user=user)
     request.session.flush()
+    if hasattr(request, "user"):
+        from django.contrib.auth.models import AnonymousUser
+
+        request.user = AnonymousUser()
+
+
+async def alogout(request):
+    """
+    Remove the authenticated user's ID from the request and flush their session
+    data.
+    """
+    # Dispatch the signal before the user is logged out so the receivers have a
+    # chance to find out *who* logged out.
+    user = getattr(request, "user", None)
+    if not getattr(user, "is_authenticated", True):
+        user = None
+    await user_logged_out.asend(sender=user.__class__, request=request, user=user)
+    await sync_to_async(lambda: request.session.flush())()
     if hasattr(request, "user"):
         from django.contrib.auth.models import AnonymousUser
 
@@ -209,6 +328,40 @@ def get_user(request):
     return user or AnonymousUser()
 
 
+async def aget_user(request):
+    """
+    Return the user model instance associated with the given request session.
+    If no user is retrieved, return an instance of `AnonymousUser`.
+    """
+    from .models import AnonymousUser
+
+    user = None
+    try:
+        user_id = await _aget_user_session_key(request)
+        backend_path = await sync_to_async(
+            lambda: request.session[BACKEND_SESSION_KEY]
+        )()
+    except KeyError:
+        pass
+    else:
+        if backend_path in settings.AUTHENTICATION_BACKENDS:
+            backend = load_backend(backend_path)
+            user = await backend.aget_user(user_id)
+            # Verify the session
+            if hasattr(user, "get_session_auth_hash"):
+                session_hash = await sync_to_async(
+                    lambda: request.session.get(HASH_SESSION_KEY)
+                )()
+                session_hash_verified = session_hash and constant_time_compare(
+                    session_hash, user.get_session_auth_hash()
+                )
+                if not session_hash_verified:
+                    await sync_to_async(lambda: request.session.flush())()
+                    user = None
+
+    return user or AnonymousUser()
+
+
 def get_permission_codename(action, opts):
     """
     Return the codename of the permission for the specified action.
@@ -228,3 +381,22 @@ def update_session_auth_hash(request, user):
     request.session.cycle_key()
     if hasattr(user, "get_session_auth_hash") and request.user == user:
         request.session[HASH_SESSION_KEY] = user.get_session_auth_hash()
+
+
+async def aupdate_session_auth_hash(request, user):
+    """
+    Updating a user's password logs out all sessions for the user.
+
+    Take the current request and the updated user object from which the new
+    session hash will be derived and update the session hash appropriately to
+    prevent a password change from logging out the session from which the
+    password was changed.
+    """
+    await sync_to_async(lambda: request.session.cycle_key())()
+    if hasattr(user, "get_session_auth_hash") and request.user == user:
+
+        @sync_to_async
+        def update_auth_hash():
+            request.session[HASH_SESSION_KEY] = user.get_session_auth_hash()
+
+        await update_auth_hash()
